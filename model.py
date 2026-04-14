@@ -1,8 +1,10 @@
-from transformers import PretrainedConfig
+from transformers import PreTrainedModel, PretrainedConfig
 import torch
 import torch.nn as nn
-from typing import Tuple
+from typing import Optional, Tuple
 import math
+
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     # 获取输入张量的形状：批量大小、序列长度、键/值对头的数量、每个头的维度大小
@@ -207,3 +209,196 @@ class Attention(nn.Module):
         output = self.wo(output)
         output = self.resid_dropout(output)
         return output
+
+class MLP(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int, multiple_of: int, dropout: float):
+        super().__init__()
+        # 如果没有指定隐藏层的维度，我们将其设置为输入维度的4倍
+        # 然后将其减少到2/3，最后确保它是multiple_of的倍数
+        if hidden_dim is None:
+            hidden_dim = 4 * dim
+            hidden_dim = int(2 * hidden_dim / 3)
+            hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+        # 定义第一层线性变换，从输入维度到隐藏维度
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        # 定义第二层线性变换，从隐藏维度到输入维度
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        # 定义第三层线性变换，从输入维度到隐藏维度
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        # 定义dropout层，用于防止过拟合
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # 前向传播函数
+        # 首先，输入x通过第一层线性变换和SILU激活函数
+        # 然后，结果乘以输入x通过第三层线性变换的结果
+        # 最后，通过第二层线性变换和dropout层
+        return self.dropout(self.w2(torch.nn.functional.silu(self.w1(x)) * self.w3(x)))
+
+class DecoderLayer(nn.Module):
+    def __init__(self, layer_id: int, args: ModelConfig):
+        super().__init__()
+        # 定义多头注意力的头数
+        self.n_heads = args.n_heads
+        # 定义输入维度
+        self.dim = args.dim
+        # 定义每个头的维度，等于输入维度除以头数
+        self.head_dim = args.dim // args.n_heads
+        # 定义LLaMA2Attention对象，用于进行多头注意力计算
+        self.attention = Attention(args)
+        # 定义LLaMA MLP对象，用于进行前馈神经网络计算
+        self.feed_forward = MLP(
+            dim=args.dim,
+            hidden_dim=args.hidden_dim,
+            multiple_of=args.multiple_of,
+            dropout=args.dropout,
+        )
+        # 定义层的ID
+        self.layer_id = layer_id
+        # 定义注意力计算的归一化层
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        # 定义前馈神经网络计算的归一化层
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+
+    def forward(self, x, freqs_cos, freqs_sin):
+        # 前向传播函数
+        # 首先，输入x经过注意力归一化层，然后进行注意力计算，结果与输入x相加得到h
+        # 然后，h经过前馈神经网络归一化层，然后进行前馈神经网络计算，结果与h相加得到输出
+        h = x + self.attention.forward(self.attention_norm(x), freqs_cos, freqs_sin)
+        out = h + self.feed_forward.forward(self.ffn_norm(h))
+        return out
+
+class Transformer(PreTrainedModel):
+    config_class = ModelConfig  # 配置类
+    last_loss: Optional[torch.Tensor] # 记录最后一次计算的损失
+
+    def __init__(self, args: ModelConfig = None):
+        super().__init__(args)
+        # 初始化模型参数
+        self.args = args
+        # 词汇表大小
+        self.vocab_size = args.vocab_size
+        # 层数
+        self.n_layers = args.n_layers
+
+        # 词嵌入层
+        self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
+        # Dropout层
+        self.dropout = nn.Dropout(args.dropout)
+        # Decoder层
+        self.layers = torch.nn.ModuleList()
+        for layer_id in range(args.n_layers):
+            self.layers.append(DecoderLayer(layer_id, args))
+        # 归一化层
+        self.norm = RMSNorm(args.dim, eps=args.norm_eps)
+        # 输出层
+        self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
+
+        # 将词嵌入层的权重与输出层的权重共享
+        self.tok_embeddings.weight = self.output.weight
+
+        # 预计算相对位置嵌入的频率
+        freqs_cos, freqs_sin = precompute_freqs_cis(self.args.dim // self.args.n_heads, self.args.max_seq_len)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+        # 初始化所有权重
+        self.apply(self._init_weights)
+        # 对残差投影进行特殊的缩放初始化
+        for pn, p in self.named_parameters():
+            if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * args.n_layers))
+
+        # 初始化最后一次前向传播的损失属性
+        self.last_loss = None
+        self.OUT = CausalLMOutputWithPast()  # 输出容器
+        self._no_split_modules = [name for name, _ in self.named_modules()]  # 不分割的模块列表
+
+    def _init_weights(self, module):
+        # 初始化权重的函数
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
+        """
+        - tokens: Optional[torch.Tensor], 输入 token 张量。
+        - targets: Optional[torch.Tensor], 目标 token 张量。
+        - kv_cache: bool, 是否使用键值缓存。
+        - kwargs: 其他关键字参数。
+
+        - self.OUT: CausalLMOutputWithPast, 包含 logits 和损失。
+        """
+
+        if 'input_ids' in kwargs:
+            tokens = kwargs['input_ids']
+        if 'labels' in kwargs:
+            targets = kwargs['labels']
+
+        # 前向传播函数
+        _bsz, seqlen = tokens.shape
+        # 通过词嵌入层和Dropout层
+        h = self.tok_embeddings(tokens)
+        h = self.dropout(h)
+        # 获取相对位置嵌入的频率
+        freqs_cos = self.freqs_cos[:seqlen]
+        freqs_sin = self.freqs_sin[:seqlen]
+
+        # 通过Decoder层
+        for layer in self.layers:
+            h = layer(h, freqs_cos, freqs_sin)
+        # 通过归一化层
+        h = self.norm(h)
+
+        if targets is not None:
+            # 如果给定了目标，计算损失
+            logits = self.output(h)
+            self.last_loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=0, reduction='none')
+        else:
+            # 推理时的小优化：只对最后一个位置的输出进行前向传播
+            logits = self.output(h[:, [-1], :])
+            self.last_loss = None
+
+        # 设置输出
+        self.OUT.__setitem__('logits', logits)
+        self.OUT.__setitem__('last_loss', self.last_loss)
+        return self.OUT
+
+
+    @torch.inference_mode()
+    def generate(self, idx, stop_id=None, max_new_tokens=256, temperature=1.0, top_k=None):
+        """
+        给定输入序列 idx（形状为 (bz,seq_len) 的长整型张量），通过多次生成新 token 来完成序列。
+        在 model.eval() 模式下运行。效率较低的采样版本，没有使用键k/v cache。
+        """
+        index = idx.shape[1]
+        for _ in range(max_new_tokens):
+            # 如果序列上下文过长，截断它到最大长度
+            idx_cond = idx if idx.size(1) <= self.args.max_seq_len else idx[:, -self.args.max_seq_len:]
+
+            # 前向传播获取序列中最后一个位置的 logits
+            logits = self(idx_cond).logits
+            logits = logits[:, -1, :] # 只保留最后一个时间步的输出
+
+            if temperature == 0.0:
+                # 选择最有可能的索引
+                _, idx_next = torch.topk(logits, k=1, dim=-1)
+            else:
+                # 缩放 logits 并应用 softmax
+                logits = logits / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                probs = torch.nn.functional.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+
+            if idx_next == stop_id:
+                break
+
+            # 将采样的索引添加到序列中并继续
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx[:, index:] # 只返回生成的token
